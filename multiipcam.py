@@ -2,36 +2,51 @@ import cv2
 import numpy as np
 import datetime
 import os
+import time
 from dotenv import load_dotenv
 
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
-# --- Put your IP webcam links here ---
+# --- Camera sources ---
 urls = {
     "myphone cam": os.getenv("FRONT_DOOR_CAM"),
     "maindoor cam": os.getenv("BACKYARD_CAM"),
-    "Laptop Cam": 0 
+    "Laptop Cam": 0
 }
 
-# Create VideoCapture objects
 caps = {name: cv2.VideoCapture(link) for name, link in urls.items()}
 
-# VideoWriter for recording
-recording = False
-rec_writer = None
-rec_camera = None  # Which camera is being recorded
+# --- Recording setup ---
+recorders = {name: None for name in caps.keys()}
+recording_flags = {name: None for name in caps.keys()}  # "MANUAL"
 
-# Fullscreen mode
-fullscreen_camera = None  # None = dashboard view
+# --- UI States ---
+fullscreen_camera = None
+lowlight_mode = 0  # 0=Normal, 1=Gray, 2=Brightness/Contrast
 
-# Mouse click state
-click_coords = None
+
+# ---------------- HELPER FUNCTIONS ---------------- #
+
+def start_recording(name, frame, mode):
+    filename = f"{name}_{mode}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    recorders[name] = cv2.VideoWriter(filename, fourcc, 20.0, (frame.shape[1], frame.shape[0]))
+    recording_flags[name] = mode
+    print(f"[INFO] {mode} recording started for {name}: {filename}")
+
+
+def stop_recording(name, mode):
+    if recorders[name] is not None:
+        recorders[name].release()
+        recorders[name] = None
+        print(f"[INFO] {mode} recording stopped for {name}")
+    recording_flags[name] = None
+
 
 def mouse_callback(event, x, y, flags, param):
-    global fullscreen_camera, click_coords
+    global fullscreen_camera
     if event == cv2.EVENT_LBUTTONDOWN and fullscreen_camera is None:
-        # Dashboard is 800x600 (2x2 grid of 400x300)
         row = y // 300
         col = x // 400
         index = row * 2 + col
@@ -40,38 +55,50 @@ def mouse_callback(event, x, y, flags, param):
             fullscreen_camera = cam_names[index]
             print(f"[INFO] Fullscreen mode: {fullscreen_camera}")
     elif event == cv2.EVENT_LBUTTONDOWN and fullscreen_camera is not None:
-        # If already in fullscreen, clicking anywhere returns to dashboard
         fullscreen_camera = None
         print("[INFO] Back to dashboard view.")
+
+
+# ---------------- MAIN ---------------- #
 
 cv2.namedWindow("Surveillance Dashboard")
 cv2.setMouseCallback("Surveillance Dashboard", mouse_callback)
 
-print("[INFO] Press 's' to save snapshot.")
-print("[INFO] Click a camera in dashboard to view fullscreen, click again to return.")
-print("[INFO] Press 'r' to start/stop recording the current fullscreen camera.")
-print("[INFO] Press 'q' to quit.")
+print("[INFO] Motion detection removed.")
+print("[INFO] Press 's' → Snapshot, 'r' → Manual Recording, 'l' → Toggle Low-Light Modes, 'q' → Quit.")
 
 while True:
     frames = []
     for name, cap in caps.items():
         ret, frame = cap.read()
         if not ret:
-            # If camera offline, show black screen
             frame = np.zeros((300, 400, 3), dtype=np.uint8)
             cv2.putText(frame, "Camera Offline", (50, 150),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         else:
             frame = cv2.resize(frame, (400, 300))
+
+            # Low-light mode filters
+            if lowlight_mode == 1:  # Gray mode
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif lowlight_mode == 2:  # Brightness/contrast boost
+                frame = cv2.convertScaleAbs(frame, alpha=1.5, beta=40)
+
+            # Manual recording
+            if recording_flags[name] == "MANUAL" and recorders[name] is not None:
+                recorders[name].write(frame)
+
+            # Overlay
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cv2.putText(frame, name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, timestamp, (10, frame.shape[0]-10),
+            cv2.putText(frame, timestamp, (10, frame.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         frames.append(frame)
 
-    # --- Decide what to show ---
+    # Dashboard / Fullscreen
     if fullscreen_camera is None:
-        # Dashboard mode (2x2 grid)
         while len(frames) < 4:
             frames.append(np.zeros((300, 400, 3), dtype=np.uint8))
 
@@ -79,55 +106,41 @@ while True:
         bottom_row = np.hstack(frames[2:4])
         dashboard = np.vstack([top_row, bottom_row])
         cv2.imshow("Surveillance Dashboard", dashboard)
-
     else:
-        # Fullscreen single camera
         cam_index = list(caps.keys()).index(fullscreen_camera)
-        frame = frames[cam_index]
-        big_frame = cv2.resize(frame, (800, 600))  # fixed size
+        big_frame = cv2.resize(frames[cam_index], (800, 600))
         cv2.imshow("Surveillance Dashboard", big_frame)
 
-        # If recording, save frame
-        if recording and rec_writer is not None and rec_camera == fullscreen_camera:
-            rec_writer.write(big_frame)
-
+    # Keys
     key = cv2.waitKey(1) & 0xFF
 
-    # --- Key Controls ---
     if key == ord('s'):
-        # Save snapshots
         for name, frame in zip(caps.keys(), frames):
             filename = f"{name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
             cv2.imwrite(filename, frame)
             print(f"[INFO] Snapshot saved: {filename}")
 
     elif key == ord('r'):
-        # Toggle recording
         if fullscreen_camera is None:
-            print("[WARN] Go fullscreen on a camera first to record.")
+            print("[WARN] Go fullscreen on a camera to record manually.")
         else:
-            if not recording:
-                # Start recording (AVI with XVID codec for compatibility)
-                filename = f"{fullscreen_camera}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.avi"
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                rec_writer = cv2.VideoWriter(filename, fourcc, 20.0, (800, 600))
-                rec_camera = fullscreen_camera
-                recording = True
-                print(f"[INFO] Recording started for {fullscreen_camera}: {filename}")
-                print("[INFO] Press 'r' again to stop recording.")
+            if recording_flags[fullscreen_camera] != "MANUAL":
+                start_recording(fullscreen_camera, frames[list(caps.keys()).index(fullscreen_camera)], "MANUAL")
             else:
-                # Stop recording
-                recording = False
-                rec_writer.release()
-                rec_writer = None
-                print("[INFO] Recording stopped and saved.")
+                stop_recording(fullscreen_camera, "MANUAL")
+
+    elif key == ord('l'):
+        lowlight_mode = (lowlight_mode + 1) % 3
+        mode_name = ["Normal", "Gray", "Brightness/Contrast"][lowlight_mode]
+        print(f"[INFO] Low-Light Mode: {mode_name}")
 
     elif key == ord('q'):
         break
 
-# Release resources
+# Cleanup
 for cap in caps.values():
     cap.release()
-if rec_writer:
-    rec_writer.release()
+for rec in recorders.values():
+    if rec is not None:
+        rec.release()
 cv2.destroyAllWindows()
